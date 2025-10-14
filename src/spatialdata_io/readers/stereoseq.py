@@ -25,7 +25,7 @@ from spatialdata_io.readers._utils._utils import _initialize_raster_models_kwarg
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-__all__ = ["stereoseq"]
+__all__ = ["stereoseq", "stereoseq_v8"]
 
 
 @inject_docs(xx=SK)
@@ -339,4 +339,302 @@ def stereoseq(
         images[Path(cell_mask_name).stem] = masks
 
     sdata = SpatialData(images=images, tables=tables, shapes=shapes, points=points)
+    return sdata
+
+
+@inject_docs(xx=SK)
+def stereoseq_v8(
+    path: str | Path,
+    dataset_id: str | None = None,
+    bin_sizes: list[int] | None = None,
+    load_analysis: bool = True,
+    imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
+    image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
+) -> SpatialData:
+    """Read *Stereo-seq* formatted dataset from SAW v8 pipeline.
+
+    This function supports the output structure from SAW (Stereo-seq Analysis Workflow) version 8,
+    which differs from version 7 in directory organization and available data types.
+
+    Parameters
+    ----------
+    path
+        Path to the directory containing the SAW v8 output data.
+    dataset_id
+        Dataset identifier. If not given will be determined automatically from file names.
+    bin_sizes
+        List of bin sizes to read from the tissue.gef file (e.g., [1, 20, 50, 100]).
+        If None, reads all available bin sizes. Common bins are 1, 5, 10, 20, 50, 100, 150, 200.
+    load_analysis
+        If True, will load pre-computed analysis results (h5ad files) from the analysis directory.
+        These typically contain clustering, dimensionality reduction, and other analysis results.
+    imread_kwargs
+        Keyword arguments passed to :func:`dask_image.imread.imread`.
+    image_models_kwargs
+        Keyword arguments passed to :class:`spatialdata.models.Image2DModel`.
+
+    Returns
+    -------
+    :class:`spatialdata.SpatialData`
+
+    Notes
+    -----
+    SAW v8 Structure:
+        - feature_expression/: Contains .raw.gef and .tissue.gef files with gene expression data
+        - analysis/: Contains pre-computed h5ad files with clustering and analysis results
+        - image/: Contains H&E images (_HE_regist.tif and _HE_tissue_cut.tif)
+        - bam/: Contains alignment files (not parsed by this function)
+
+    The tissue.gef file contains binned gene expression data at multiple resolutions (bin1, bin20, etc.),
+    while the analysis folder contains downstream analysis results.
+    """
+    image_models_kwargs, _ = _initialize_raster_models_kwargs(image_models_kwargs, {})
+    path = Path(path)
+
+    # Determine dataset_id if not provided
+    if dataset_id is None:
+        feature_exp_path = path / "feature_expression"
+        if not feature_exp_path.exists():
+            raise ValueError(f"feature_expression directory not found in {path}")
+        
+        # Find .tissue.gef file to extract dataset_id
+        gef_files = list(feature_exp_path.glob("*.tissue.gef"))
+        if not gef_files:
+            raise ValueError(f"No .tissue.gef files found in {feature_exp_path}")
+        
+        # Extract dataset_id from filename (e.g., B05062E4.tissue.gef -> B05062E4)
+        dataset_id = gef_files[0].stem.replace(".tissue", "")
+
+    # Define file paths
+    tissue_gef_path = path / "feature_expression" / f"{dataset_id}.tissue.gef"
+    image_dir = path / "image"
+    analysis_dir = path / "analysis"
+
+    if not tissue_gef_path.exists():
+        raise ValueError(f"tissue.gef file not found: {tissue_gef_path}")
+
+    # Read tissue.gef file
+    tissue_gef = h5py.File(str(tissue_gef_path), "r")
+
+    # Determine which bin sizes to read
+    available_bins = list(tissue_gef[SK.GENE_EXP].keys())
+    if bin_sizes is None:
+        bins_to_read = available_bins
+    else:
+        bins_to_read = [f"bin{size}" for size in bin_sizes]
+        # Validate that requested bins exist
+        missing_bins = set(bins_to_read) - set(available_bins)
+        if missing_bins:
+            raise ValueError(
+                f"Requested bin sizes {missing_bins} not found in tissue.gef. "
+                f"Available bins: {available_bins}"
+            )
+
+    # Initialize containers
+    images = {}
+    tables = {}
+    points = {}
+
+    # Read images
+    if image_dir.exists():
+        image_patterns = [
+            re.compile(r".*_HE_regist\.tif$"),
+            re.compile(r".*_HE_tissue_cut\.tif$"),
+        ]
+        image_files = [
+            f for f in os.listdir(image_dir) 
+            if any(pattern.match(f) for pattern in image_patterns)
+        ]
+        
+        for image_file in image_files:
+            image_name = Path(image_file).stem
+            # Use appropriate dims based on what imread returns
+            # For RGB images, imread typically returns (z, y, x, c) format
+            # We'll let Image2DModel handle the conversion by not specifying dims
+            img_data = imread(image_dir / image_file, **imread_kwargs)
+            
+            # For SAW v8, images are RGB TIFFs in (1, y, x, 3) format from imread
+            # We need to convert to (c, y, x) - squeeze and move channels to first dim
+            if img_data.ndim == 4 and img_data.shape[0] == 1:
+                # Remove singleton first dimension and move channels from last to first
+                img_data = img_data[0]  # Now (y, x, c)
+            
+            # Now transpose from (y, x, c) to (c, y, x)
+            if img_data.ndim == 3 and img_data.shape[-1] in [1, 3, 4]:  # Last dim is channels
+                img_data = np.moveaxis(img_data, -1, 0)  # Move last axis to first
+            
+            images[image_name] = Image2DModel.parse(
+                img_data,
+                dims=("c", "y", "x"),
+                **image_models_kwargs,
+            )
+
+    # Read binned gene expression data from tissue.gef
+    for bin_name in bins_to_read:
+        bin_group = tissue_gef[SK.GENE_EXP][bin_name]
+        bin_attrs = dict(bin_group[SK.EXPRESSION].attrs)
+        resolution = bin_attrs[SK.RESOLUTION].item()
+
+        # Get gene information
+        gene_data = bin_group[SK.FEATURE_KEY][:]
+        df_gene = pd.DataFrame(
+            gene_data,
+            columns=["geneID", SK.GENE_NAME, SK.OFFSET, SK.COUNT]
+        )
+        df_gene["geneID"] = df_gene["geneID"].str.decode("utf-8")
+        df_gene[SK.GENE_NAME] = df_gene[SK.GENE_NAME].str.decode("utf-8")
+        
+        # Handle duplicate gene names by making them unique
+        # Some genes have the same name but different IDs (e.g., different isoforms)
+        df_gene["gene_name_unique"] = df_gene[SK.GENE_NAME]
+        duplicated_mask = df_gene[SK.GENE_NAME].duplicated(keep=False)
+        if duplicated_mask.any():
+            # For duplicates, append gene ID to make unique
+            df_gene.loc[duplicated_mask, "gene_name_unique"] = (
+                df_gene.loc[duplicated_mask, SK.GENE_NAME] + "_" + 
+                df_gene.loc[duplicated_mask, "geneID"]
+            )
+
+        # Get expression data (x, y, count)
+        expression_data = bin_group[SK.EXPRESSION][:]
+        df_points = pd.DataFrame(
+            expression_data,
+            columns=[SK.COORD_X, SK.COORD_Y, SK.COUNT]
+        )
+
+        # Validate offset calculation
+        assert np.array_equal(
+            df_gene[SK.OFFSET],
+            np.insert(np.cumsum(df_gene[SK.COUNT]), 0, 0)[:-1]
+        )
+
+        # Unroll gene names by count to match coordinate counts
+        # Use unique gene names to avoid issues with duplicates
+        df_points[SK.FEATURE_KEY] = [
+            name
+            for _, (name, cell_count) in df_gene[["gene_name_unique", SK.COUNT]].iterrows()
+            for _ in range(cell_count)
+        ]
+        df_points[SK.FEATURE_KEY] = df_points[SK.FEATURE_KEY].astype("category")
+
+        # Create unique bin IDs
+        points_coords = df_points[[SK.COORD_X, SK.COORD_Y]].copy()
+        points_coords.drop_duplicates(inplace=True)
+        points_coords.reset_index(inplace=True, drop=True)
+        points_coords["bin_id"] = points_coords.index
+
+        name_points_element = f"{bin_name}_genes"
+        name_table_element = f"{bin_name}_table"
+
+        # Map each point to its bin_id
+        index_to_bin_id = pd.merge(
+            df_points[[SK.COORD_X, SK.COORD_Y]],
+            points_coords,
+            on=[SK.COORD_X, SK.COORD_Y],
+            how="left",
+            validate="many_to_one",
+        )
+
+        # Create obs for AnnData
+        obs = pd.DataFrame({
+            SK.INSTANCE_KEY: points_coords.index,
+            SK.REGION_KEY: name_points_element
+        })
+        obs[SK.REGION_KEY] = obs[SK.REGION_KEY].astype("category")
+
+        # Create expression matrix as sparse matrix
+        expression_matrix = coo_matrix(
+            (
+                df_points[SK.COUNT],
+                (
+                    index_to_bin_id.loc[df_points.index]["bin_id"].to_numpy(),
+                    df_points[SK.FEATURE_KEY].cat.codes
+                ),
+            ),
+            shape=(len(points_coords), len(df_points[SK.FEATURE_KEY].cat.categories)),
+        ).tocsr()
+
+        # Create points element
+        points_coords.drop(columns=["bin_id"], inplace=True)
+        points_element = PointsModel.parse(
+            points_coords,
+            coordinates={"x": SK.COORD_X, "y": SK.COORD_Y},
+        )
+
+        # Prepare gene info for var
+        # Only keep genes that have expression data in this bin
+        genes_with_expression = df_points[SK.FEATURE_KEY].cat.categories
+        df_gene_indexed = df_gene.set_index("gene_name_unique")
+        df_gene_indexed.index.name = None
+        # Filter and reorder to match the genes actually in the expression matrix
+        df_gene_filtered = df_gene_indexed.loc[genes_with_expression, :]
+
+        # Create AnnData object
+        adata = ad.AnnData(expression_matrix, obs=obs, var=df_gene_filtered)
+        
+        # Add resolution and bin info to uns
+        adata.uns["resolution"] = resolution
+        adata.uns["bin_name"] = bin_name
+
+        # Create table
+        table = TableModel.parse(
+            adata,
+            region=name_points_element,
+            region_key=SK.REGION_KEY.value,
+            instance_key=SK.INSTANCE_KEY.value,
+        )
+
+        tables[name_table_element] = table
+        points[name_points_element] = points_element
+
+    # Load pre-computed analysis results if requested
+    if load_analysis and analysis_dir.exists():
+        h5ad_files = list(analysis_dir.glob("*.h5ad"))
+        for h5ad_file in h5ad_files:
+            # Extract bin size from filename (e.g., B05062E4.bin20_1.0.h5ad)
+            file_stem = h5ad_file.stem
+            # Parse bin info from filename
+            match = re.search(r'\.bin(\d+)_', file_stem)
+            if match:
+                bin_size = match.group(1)
+                table_name = f"analysis_bin{bin_size}"
+                
+                # Read the h5ad file
+                adata_analysis = ad.read_h5ad(h5ad_file)
+                
+                # Check if spatial coordinates exist
+                if "spatial" in adata_analysis.obsm:
+                    # Add region and instance_key for TableModel
+                    region_name = f"analysis_bin{bin_size}_points"
+                    adata_analysis.obs[SK.REGION_KEY] = region_name
+                    adata_analysis.obs[SK.REGION_KEY] = adata_analysis.obs[SK.REGION_KEY].astype("category")
+                    adata_analysis.obs[SK.INSTANCE_KEY] = adata_analysis.obs.index
+                    
+                    # Create table
+                    table_analysis = TableModel.parse(
+                        adata_analysis,
+                        region=region_name,
+                        region_key=SK.REGION_KEY.value,
+                        instance_key=SK.INSTANCE_KEY.value,
+                    )
+                    tables[table_name] = table_analysis
+                    
+                    # Create points from spatial coordinates
+                    spatial_coords = adata_analysis.obsm["spatial"]
+                    points_df = pd.DataFrame(
+                        spatial_coords,
+                        columns=[SK.COORD_X, SK.COORD_Y]
+                    )
+                    # Ensure columns are float type (PointsModel validation requires float or int types)
+                    points_df[SK.COORD_X] = points_df[SK.COORD_X].astype(float)
+                    points_df[SK.COORD_Y] = points_df[SK.COORD_Y].astype(float)
+                    points_element = PointsModel.parse(
+                        points_df,
+                        coordinates={"x": SK.COORD_X, "y": SK.COORD_Y},
+                    )
+                    points[region_name] = points_element
+
+    tissue_gef.close()
+    
+    sdata = SpatialData(images=images, tables=tables, points=points)
     return sdata

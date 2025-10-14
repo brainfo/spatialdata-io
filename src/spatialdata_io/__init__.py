@@ -11,7 +11,7 @@ from spatialdata_io.readers.mcmicro import mcmicro
 from spatialdata_io.readers.merscope import merscope
 from spatialdata_io.readers.seqfish import seqfish
 from spatialdata_io.readers.steinbock import steinbock
-from spatialdata_io.readers.stereoseq import stereoseq
+from spatialdata_io.readers.stereoseq import stereoseq, stereoseq_v8
 from spatialdata_io.readers.visium import visium
 from spatialdata_io.readers.visium_hd import visium_hd
 from spatialdata_io.readers.xenium import (
@@ -31,6 +31,7 @@ _readers_technologies = [
     "seqfish",
     "steinbock",
     "stereoseq",
+    "stereoseq_v8",
     "visium",
     "visium_hd",
     "xenium",
