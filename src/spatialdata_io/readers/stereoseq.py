@@ -353,8 +353,7 @@ def stereoseq_v8(
 ) -> SpatialData:
     """Read *Stereo-seq* formatted dataset from SAW v8 pipeline.
 
-    This function supports the output structure from SAW (Stereo-seq Analysis Workflow) version 8,
-    which differs from version 7 in directory organization and available data types.
+    This function supports the output structure from SAW (Stereo-seq Analysis Workflow) version 8
 
     Parameters
     ----------
@@ -380,13 +379,9 @@ def stereoseq_v8(
     Notes
     -----
     SAW v8 Structure:
-        - feature_expression/: Contains .raw.gef and .tissue.gef files with gene expression data
-        - analysis/: Contains pre-computed h5ad files with clustering and analysis results
-        - image/: Contains H&E images (_HE_regist.tif and _HE_tissue_cut.tif)
-        - bam/: Contains alignment files (not parsed by this function)
-
-    The tissue.gef file contains binned gene expression data at multiple resolutions (bin1, bin20, etc.),
-    while the analysis folder contains downstream analysis results.
+        - feature_expression/: Contains .tissue.gef files with gene expression data
+        - analysis/: Contains pre-computed h5ad files
+        - image/: Contains microscopy images (.tif/.tiff format, e.g., H&E, ssDNA, or other stains)
     """
     image_models_kwargs, _ = _initialize_raster_models_kwargs(image_models_kwargs, {})
     path = Path(path)
@@ -437,13 +432,11 @@ def stereoseq_v8(
 
     # Read images
     if image_dir.exists():
-        image_patterns = [
-            re.compile(r".*_HE_regist\.tif$"),
-            re.compile(r".*_HE_tissue_cut\.tif$"),
-        ]
+        # Accept any .tif or .tiff files (could be HE, ssDNA, or other stains)
+        image_pattern = re.compile(r".*\.tiff?$", re.IGNORECASE)
         image_files = [
             f for f in os.listdir(image_dir) 
-            if any(pattern.match(f) for pattern in image_patterns)
+            if image_pattern.match(f)
         ]
         
         for image_file in image_files:
@@ -454,6 +447,7 @@ def stereoseq_v8(
             img_data = imread(image_dir / image_file, **imread_kwargs)
             
             # For SAW v8, images are RGB TIFFs in (1, y, x, 3) format from imread
+            # Question: could this (1, y, x, 3) format be microscope and scan protocol specific?
             # We need to convert to (c, y, x) - squeeze and move channels to first dim
             if img_data.ndim == 4 and img_data.shape[0] == 1:
                 # Remove singleton first dimension and move channels from last to first
