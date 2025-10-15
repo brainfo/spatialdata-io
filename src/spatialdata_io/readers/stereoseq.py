@@ -535,6 +535,10 @@ def stereoseq_v8(
             SK.REGION_KEY: name_points_element
         })
         obs[SK.REGION_KEY] = obs[SK.REGION_KEY].astype("category")
+        
+        # Add spatial coordinates to obs
+        obs["x"] = points_coords[SK.COORD_X].values
+        obs["y"] = points_coords[SK.COORD_Y].values
 
         # Create expression matrix as sparse matrix
         expression_matrix = coo_matrix(
@@ -549,9 +553,9 @@ def stereoseq_v8(
         ).tocsr()
 
         # Create points element
-        points_coords.drop(columns=["bin_id"], inplace=True)
+        points_coords_for_points = points_coords.drop(columns=["bin_id"])
         points_element = PointsModel.parse(
-            points_coords,
+            points_coords_for_points,
             coordinates={"x": SK.COORD_X, "y": SK.COORD_Y},
         )
 
@@ -565,6 +569,9 @@ def stereoseq_v8(
 
         # Create AnnData object
         adata = ad.AnnData(expression_matrix, obs=obs, var=df_gene_filtered)
+        
+        # Add spatial coordinates to obsm
+        adata.obsm["spatial"] = points_coords[[SK.COORD_X, SK.COORD_Y]].to_numpy()
         
         # Add resolution and bin info to uns
         adata.uns["resolution"] = resolution
@@ -603,6 +610,12 @@ def stereoseq_v8(
                     adata_analysis.obs[SK.REGION_KEY] = region_name
                     adata_analysis.obs[SK.REGION_KEY] = adata_analysis.obs[SK.REGION_KEY].astype("category")
                     adata_analysis.obs[SK.INSTANCE_KEY] = adata_analysis.obs.index
+                    
+                    # Add x and y coordinates to obs if not already present
+                    if "x" not in adata_analysis.obs and "y" not in adata_analysis.obs:
+                        spatial_coords = adata_analysis.obsm["spatial"]
+                        adata_analysis.obs["x"] = spatial_coords[:, 0]
+                        adata_analysis.obs["y"] = spatial_coords[:, 1]
                     
                     # Create table
                     table_analysis = TableModel.parse(
