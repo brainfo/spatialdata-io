@@ -441,26 +441,33 @@ def stereoseq_v8(
         
         for image_file in image_files:
             image_name = Path(image_file).stem
-            # Use appropriate dims based on what imread returns
-            # For RGB images, imread typically returns (z, y, x, c) format
-            # We'll let Image2DModel handle the conversion by not specifying dims
+
             img_data = imread(image_dir / image_file, **imread_kwargs)
-            
-            # For SAW v8, images are RGB TIFFs in (1, y, x, 3) format from imread
-            # Question: could this (1, y, x, 3) format be microscope and scan protocol specific?
-            # We need to convert to (c, y, x) - squeeze and move channels to first dim
+
+            # (1, y, x, c) -> (y, x, c)
             if img_data.ndim == 4 and img_data.shape[0] == 1:
-                # Remove singleton first dimension and move channels from last to first
-                img_data = img_data[0]  # Now (y, x, c)
-            
-            # Now transpose from (y, x, c) to (c, y, x)
-            if img_data.ndim == 3 and img_data.shape[-1] in [1, 3, 4]:  # Last dim is channels
-                img_data = np.moveaxis(img_data, -1, 0)  # Move last axis to first
-            
+                img_data = img_data[0]
+
+            # (y, x, c) -> (c, y, x)
+            if img_data.ndim == 3 and img_data.shape[-1] in [1, 3, 4]:
+                img_data = np.moveaxis(img_data, -1, 0)
+
+            # img_data is now (c, y, x)
+            n_channels = img_data.shape[0] if img_data.ndim == 3 else 1
+
+            # Make a per-image copy of image_models_kwargs
+            im_kwargs = deepcopy(image_models_kwargs)
+
+            # If user didn't specify c_coords, auto-set for RGB / RGBA
+            if "c_coords" not in im_kwargs and n_channels in (3, 4):
+                im_kwargs["c_coords"] = (
+                    ["r", "g", "b"] if n_channels == 3 else ["r", "g", "b", "a"]
+                )
+
             images[image_name] = Image2DModel.parse(
                 img_data,
                 dims=("c", "y", "x"),
-                **image_models_kwargs,
+                **im_kwargs,
             )
 
     # Read binned gene expression data from tissue.gef
