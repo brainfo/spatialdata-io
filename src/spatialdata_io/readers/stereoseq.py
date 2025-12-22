@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from copy import deepcopy
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -13,7 +14,7 @@ import pandas as pd
 from dask_image.imread import imread
 from geopandas import GeoDataFrame, GeoSeries
 from scipy.sparse import coo_matrix
-from shapely import Polygon
+from shapely import Polygon, box
 from spatialdata import SpatialData
 from spatialdata.models import Image2DModel, PointsModel, ShapesModel, TableModel
 from tqdm import tqdm
@@ -428,6 +429,7 @@ def stereoseq_v8(
     # Initialize containers
     images = {}
     tables = {}
+    shapes = {}
     points = {}
 
     # Read images
@@ -595,6 +597,31 @@ def stereoseq_v8(
         tables[name_table_element] = table
         points[name_points_element] = points_element
 
+        # Create square shapes for this bin size
+        # Side length formula: bin_size × 0.25 μm (bin1=0.25μm, bin20=5μm, etc.)
+        bin_size_num = int(bin_name.replace("bin", ""))
+        side_length = bin_size_num * 0.25
+        half_side = side_length / 2
+
+        # Create square polygons centered at each point coordinate
+        square_polygons = [
+            box(
+                row[SK.COORD_X] - half_side,
+                row[SK.COORD_Y] - half_side,
+                row[SK.COORD_X] + half_side,
+                row[SK.COORD_Y] + half_side,
+            )
+            for _, row in points_coords_for_points.iterrows()
+        ]
+
+        # Create GeoDataFrame with squares
+        shapes_gdf = GeoDataFrame(geometry=GeoSeries(square_polygons))
+        shapes_gdf.index = obs[SK.INSTANCE_KEY].values
+
+        # Parse with ShapesModel
+        name_shapes_element = f"{bin_name}_shapes"
+        shapes[name_shapes_element] = ShapesModel.parse(shapes_gdf)
+
     # Load pre-computed analysis results if requested
     if load_analysis and analysis_dir.exists():
         h5ad_files = list(analysis_dir.glob("*.h5ad"))
@@ -650,5 +677,5 @@ def stereoseq_v8(
 
     tissue_gef.close()
     
-    sdata = SpatialData(images=images, tables=tables, points=points)
+    sdata = SpatialData(images=images, tables=tables, shapes=shapes, points=points)
     return sdata
