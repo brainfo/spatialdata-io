@@ -598,9 +598,9 @@ def stereoseq_v8(
         points[name_points_element] = points_element
 
         # Create square shapes for this bin size
-        # Side length formula: bin_size × 0.25 μm (bin1=0.25μm, bin20=5μm, etc.)
+        # Side length formula: bin_size × 0.5 μm (bin1=0.5μm, bin20=10μm, etc.)
         bin_size_num = int(bin_name.replace("bin", ""))
-        side_length = bin_size_num * 0.25
+        side_length = bin_size_num * 0.5
         half_side = side_length / 2
 
         # Create square polygons centered at each point coordinate
