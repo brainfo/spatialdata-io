@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 from copy import deepcopy
 from pathlib import Path
 from types import MappingProxyType
@@ -27,6 +28,229 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 __all__ = ["stereoseq", "stereoseq_v8"]
+
+
+def _convert_uint16_to_uint8(
+    img_data: np.ndarray,
+    clip: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """Convert uint16 image data to uint8.
+
+    Parameters
+    ----------
+    img_data
+        Image data array, potentially uint16.
+    clip
+        Optional tuple of (low_percentile, high_percentile) for percentile-based
+        clipping before scaling. For example, (1, 99) clips values below the 1st
+        percentile and above the 99th percentile. This helps with outliers and
+        improves contrast. If None, scales the full uint16 range (0-65535) to uint8.
+
+    Returns
+    -------
+    Image data as uint8.
+    """
+    if img_data.dtype == np.uint16:
+        if clip is not None:
+            low_p, high_p = clip
+            low_val = np.percentile(img_data, low_p)
+            high_val = np.percentile(img_data, high_p)
+            img_data = np.clip(img_data, low_val, high_val)
+            # Scale clipped range to 0-255
+            img_data = ((img_data - low_val) / (high_val - low_val) * 255).astype(np.uint8)
+        else:
+            # Scale from uint16 (0-65535) to uint8 (0-255)
+            img_data = (img_data / 65535.0 * 255).astype(np.uint8)
+    return img_data
+
+
+def _unroll_gene_names_by_count(
+    df_gene: pd.DataFrame,
+    gene_name_col: str,
+    count_col: str,
+) -> list[str]:
+    """Unroll gene names by count to create gene-to-coordinate mapping.
+
+    This creates a list where each gene name is repeated according to its count,
+    enabling mapping between coordinate counts and gene names.
+
+    Parameters
+    ----------
+    df_gene
+        DataFrame containing gene information with name and count columns.
+    gene_name_col
+        Column name containing gene names.
+    count_col
+        Column name containing counts per gene.
+
+    Returns
+    -------
+    List of gene names, where each name is repeated by its count.
+    """
+    return [
+        name
+        for _, (name, cell_count) in df_gene[[gene_name_col, count_col]].iterrows()
+        for _ in range(cell_count)
+    ]
+
+
+def _create_cell_polygons_from_borders(
+    cellbin_gef: h5py.File,
+    centroids_x: pd.Series,
+    centroids_y: pd.Series,
+    index: pd.Index,
+) -> GeoDataFrame:
+    """Create cell polygon shapes from cellbin border coordinates.
+
+    The cellbin format stores cell borders as 32-point offsets from centroids.
+    This function converts them to proper polygon geometries.
+
+    Parameters
+    ----------
+    cellbin_gef
+        Open h5py File handle to the cellbin.gef file.
+    centroids_x
+        Series of x centroid coordinates, indexed by cell.
+    centroids_y
+        Series of y centroid coordinates, indexed by cell.
+    index
+        Index to use for the resulting GeoDataFrame.
+
+    Returns
+    -------
+    GeoDataFrame with polygon geometries for each cell.
+    """
+    # The borders are stored as (n_cells, 32, 2) array - 32 points with (x, y) offsets
+    cell_coordinates = [x for i in range(1, 33) for x in (f"x_{i}", f"y_{i}")]
+    n_cells, n_coords, xy = cellbin_gef[SK.CELL_BIN][SK.CELL_BORDER][:].shape
+    arr = cellbin_gef[SK.CELL_BIN][SK.CELL_BORDER][:]
+    new_arr = arr.reshape(n_cells, n_coords * xy)
+    df_coords = pd.DataFrame(new_arr, columns=cell_coordinates, index=index)
+
+    x_coords = df_coords.filter(regex="x_")
+    y_coords = df_coords.filter(regex="y_")
+    polygons = []
+    for (x_index, x_row), (y_index, y_row) in tqdm(
+        zip(x_coords.iterrows(), y_coords.iterrows(), strict=False),
+        desc="Creating cell polygons",
+        total=len(df_coords),
+    ):
+        assert x_index == y_index
+        # The polygonal cell coordinates are stored as offsets from the centroids
+        x = x_row[x_row != int(SK.PADDING_VALUE)]
+        y = y_row[y_row != int(SK.PADDING_VALUE)]
+        x = x + centroids_x[x_index]
+        y = y + centroids_y[y_index]
+        assert len(x) == len(y)
+        xy_pairs = np.vstack((x, y)).T
+        polygon = Polygon(xy_pairs)
+        polygons.append(polygon)
+
+    gs = GeoSeries(polygons, index=df_coords.index)
+    polygons_gdf = GeoDataFrame(geometry=gs)
+    return ShapesModel.parse(polygons_gdf)
+
+
+def _read_cellbin_data(
+    cellbin_gef: h5py.File,
+    base_adata: ad.AnnData | None = None,
+) -> tuple[ad.AnnData, np.ndarray]:
+    """Read cell-level data from a cellbin.gef file.
+
+    Parameters
+    ----------
+    cellbin_gef
+        Open h5py File handle to the cellbin.gef file.
+    base_adata
+        Optional base AnnData to merge cell info into. If None, creates a minimal
+        AnnData with just obs and var from cellbin.
+
+    Returns
+    -------
+    Tuple of (adata, spatial_coords) where:
+        - adata: AnnData with cell metadata in obs, gene info in var, and
+          expression data in uns
+        - spatial_coords: numpy array of shape (n_cells, 2) with x, y coordinates
+    """
+    # Read cell info
+    obs = pd.DataFrame(cellbin_gef[SK.CELL_BIN][SK.CELL_DATASET][:])
+    obs.columns = [
+        SK.CELL_ID,
+        SK.COORD_X,
+        SK.COORD_Y,
+        SK.OFFSET,
+        SK.GENE_COUNT,
+        SK.EXP_COUNT,
+        SK.DNBCOUNT,
+        SK.CELL_AREA,
+        SK.CELL_TYPE_ID,
+        SK.CLUSTER_ID,
+    ]
+    obs[SK.CELL_EXON] = cellbin_gef[SK.CELL_BIN][SK.CELL_EXON][:]
+
+    # Extract spatial coordinates
+    obsm_spatial = obs[[SK.COORD_X, SK.COORD_Y]].to_numpy()
+    obs = obs.drop([SK.COORD_X, SK.COORD_Y], axis=1)
+
+    # Read gene info
+    var = pd.DataFrame(
+        cellbin_gef[SK.CELL_BIN][SK.FEATURE_KEY][:],
+        columns=[
+            SK.GENE_NAME,
+            SK.OFFSET,
+            SK.CELL_COUNT,
+            SK.EXP_COUNT,
+            SK.MAX_MID_COUNT,
+        ],
+    )
+    var[SK.GENE_NAME] = var[SK.GENE_NAME].str.decode("utf-8")
+    var[SK.GENE_EXON] = cellbin_gef[SK.CELL_BIN][SK.GENE_EXON][:]
+
+    if base_adata is not None:
+        # Merge into existing adata
+        obs.index = base_adata.obs.index
+        base_adata.obs = pd.merge(base_adata.obs, obs, left_index=True, right_index=True)
+        var.index = base_adata.var.index
+        base_adata.var = pd.merge(base_adata.var, var, left_index=True, right_index=True)
+        base_adata.obsm[SK.SPATIAL_KEY] = obsm_spatial
+        adata = base_adata
+    else:
+        # Create minimal AnnData for cellbin-only mode
+        obs.index = obs.index.astype(str)
+        var = var.set_index(SK.GENE_NAME)
+        var.index.name = None
+        adata = ad.AnnData(obs=obs, var=var)
+        adata.obsm[SK.SPATIAL_KEY] = obsm_spatial
+
+    # Add expression data to uns
+    cell_exp = cellbin_gef[SK.CELL_BIN][SK.CELL_EXP]
+    gene_exp = cellbin_gef[SK.CELL_BIN][SK.GENE_EXP]
+    cellbin_uns = {
+        SK.GENE_ID: cell_exp[SK.GENE_ID][:],
+        SK.CELL_EXP: cell_exp[SK.COUNT][:],
+        SK.GENE_EXP_EXON: cellbin_gef[SK.CELL_BIN][SK.CELL_EXP_EXON][:],
+        SK.CELL_ID: gene_exp[SK.CELL_ID][:],
+        SK.GENE_EXP: gene_exp[SK.COUNT][:],
+    }
+    cellbin_uns_df = pd.DataFrame(cellbin_uns)
+
+    adata.uns["cellBin_cell_gene_exon_exp"] = cellbin_uns_df
+    adata.uns["cellBin_blockIndex"] = cellbin_gef[SK.CELL_BIN][SK.BLOCK_INDEX][:]
+    adata.uns["cellBin_blockSize"] = cellbin_gef[SK.CELL_BIN][SK.BLOCK_SIZE][:]
+    adata.uns["cellBin_cellTypeList"] = cellbin_gef[SK.CELL_BIN][SK.CELL_TYPE_LIST][:]
+
+    # Add cellbin attrs to uns
+    cellbin_attrs = {}
+    for key in cellbin_gef.attrs.keys():
+        cellbin_attrs[key] = cellbin_gef.attrs[key]
+    adata.uns["cellBin_attrs"] = cellbin_attrs
+
+    # Correct dtype for categorical columns
+    for column_name in [SK.CELL_TYPE_ID, SK.CLUSTER_ID]:
+        if column_name in adata.obs.columns:
+            adata.obs[column_name] = adata.obs[column_name].astype("category")
+
+    return adata, obsm_spatial
 
 
 @inject_docs(xx=SK)
@@ -115,87 +339,22 @@ def stereoseq(
     path_cellbin = path / SK.CELLCUT / cellbin_gef_filename[0]
     cellbin_gef = h5py.File(str(path_cellbin), "r")
 
-    # add cell info to obs
-    obs = pd.DataFrame(cellbin_gef[SK.CELL_BIN][SK.CELL_DATASET][:])
-    obs.columns = [
-        SK.CELL_ID,
-        SK.COORD_X,
-        SK.COORD_Y,
-        SK.OFFSET,
-        SK.GENE_COUNT,
-        SK.EXP_COUNT,
-        SK.DNBCOUNT,
-        SK.CELL_AREA,
-        SK.CELL_TYPE_ID,
-        SK.CLUSTER_ID,
-    ]
-    obs[SK.CELL_EXON] = cellbin_gef[SK.CELL_BIN][SK.CELL_EXON][:]
-
-    # add centroids to obsm
-    obsm_spatial = obs[[SK.COORD_X, SK.COORD_Y]].to_numpy()
-    obs = obs.drop([SK.COORD_X, SK.COORD_Y], axis=1)
-
-    adata.obsm[SK.SPATIAL_KEY] = obsm_spatial
-
-    # add gene info to var
-    var = pd.DataFrame(
-        cellbin_gef[SK.CELL_BIN][SK.FEATURE_KEY][:],
-        columns=[
-            SK.GENE_NAME,
-            SK.OFFSET,
-            SK.CELL_COUNT,
-            SK.EXP_COUNT,
-            SK.MAX_MID_COUNT,
-        ],
-    )
-    var[SK.GENE_NAME] = var[SK.GENE_NAME].str.decode("utf-8")
-    var[SK.GENE_EXON] = cellbin_gef[SK.CELL_BIN][SK.GENE_EXON][:]
-
-    # merge columns of obs and var to adata.obs and adata.var
-    obs.index = adata.obs.index
-    adata.obs = pd.merge(adata.obs, obs, left_index=True, right_index=True)
-    var.index = adata.var.index
-    adata.var = pd.merge(adata.var, var, left_index=True, right_index=True)
+    # Read cellbin data using shared helper
+    adata, obsm_spatial = _read_cellbin_data(cellbin_gef, base_adata=adata)
 
     # add region and instance_id to obs for the TableModel
     adata.obs[SK.REGION_KEY] = f"{SK.REGION}_circles"
     adata.obs[SK.REGION_KEY] = adata.obs[SK.REGION_KEY].astype("category")
     adata.obs[SK.INSTANCE_KEY] = adata.obs.index
 
-    # add all leftover columns in cellbin which don't fit .obs or .var to uns
-    cell_exp = cellbin_gef[SK.CELL_BIN][SK.CELL_EXP]
-    gene_exp = cellbin_gef[SK.CELL_BIN][SK.GENE_EXP]
-    cellbin_uns = {
-        SK.GENE_ID: cell_exp[SK.GENE_ID][:],
-        SK.CELL_EXP: cell_exp[SK.COUNT][:],
-        SK.GENE_EXP_EXON: cellbin_gef[SK.CELL_BIN][SK.CELL_EXP_EXON][:],
-        SK.CELL_ID: gene_exp[SK.CELL_ID][:],
-        SK.GENE_EXP: gene_exp[SK.COUNT][:],
-        SK.GENE_EXP_EXON: cellbin_gef[SK.CELL_BIN][SK.GENE_EXP_EXON][:],
-    }
-    cellbin_uns_df = pd.DataFrame(cellbin_uns)
 
-    adata.uns["cellBin_cell_gene_exon_exp"] = cellbin_uns_df
-    adata.uns["cellBin_blockIndex"] = cellbin_gef[SK.CELL_BIN][SK.BLOCK_INDEX][:]
-    adata.uns["cellBin_blockSize"] = cellbin_gef[SK.CELL_BIN][SK.BLOCK_SIZE][:]
-    adata.uns["cellBin_cellTypeList"] = cellbin_gef[SK.CELL_BIN][SK.CELL_TYPE_LIST][:]
-
-    # add cellbin attrs to uns
-    cellbin_attrs = {}
-    for i in cellbin_gef.attrs.keys():
-        cellbin_attrs[i] = cellbin_gef.attrs[i]
-    adata.uns["cellBin_attrs"] = cellbin_attrs
-
-    # let's correct the dtype for some columns
-    for column_name in [SK.CELL_TYPE_ID, SK.CLUSTER_ID]:
-        adata.obs[column_name] = adata.obs[column_name].astype("category")
-
-    images = {
-        Path(name).stem: Image2DModel.parse(
-            imread(path / SK.REGISTER / name, **imread_kwargs), dims=("c", "y", "x"), **image_models_kwargs
+    images = {}
+    for name in image_filenames:
+        img_data = imread(path / SK.REGISTER / name, **imread_kwargs)
+        img_data = _convert_uint16_to_uint8(np.asarray(img_data))
+        images[Path(name).stem] = Image2DModel.parse(
+            img_data, dims=("c", "y", "x"), **image_models_kwargs
         )
-        for name in image_filenames
-    }
 
     cells_table = TableModel.parse(
         adata,
@@ -299,39 +458,16 @@ def stereoseq(
             tables[name_table_element] = table
             points[name_points_element] = points_element
 
-    # add cell border shapes element
-    cell_coordinates = [x for i in range(1, 33) for x in ("x_" + str(i), "y_" + str(i))]
-    n_cells, n_coords, xy = cellbin_gef[SK.CELL_BIN][SK.CELL_BORDER][:].shape
-    arr = cellbin_gef[SK.CELL_BIN][SK.CELL_BORDER][:]
-    new_arr = arr.reshape(n_cells, n_coords * xy)
-    df_coords = pd.DataFrame(new_arr, columns=cell_coordinates, index=cells_table.obs.index)
-
+    # add cell border shapes element using shared helper
     x_original = shapes[f"{SK.REGION}_circles"].geometry.centroid.x
     y_original = shapes[f"{SK.REGION}_circles"].geometry.centroid.y
-
-    x_coords = df_coords.filter(regex="x_")
-    y_coords = df_coords.filter(regex="y_")
-    polygons = []
-    for (x_index, x_row), (y_index, y_row) in tqdm(
-        zip(x_coords.iterrows(), y_coords.iterrows(), strict=False), desc="creating polygons", total=len(df_coords)
-    ):
-        assert x_index == y_index
-        # the polygonal cells coordinates are stored as offsets from the centroids, so let's add the centroids
-        x = x_row[x_row != int(SK.PADDING_VALUE)]
-        y = y_row[y_row != int(SK.PADDING_VALUE)]
-        x = x + x_original[x_index]
-        y = y + y_original[y_index]
-        assert len(x) == len(y)
-        xy_pairs = np.vstack((x, y)).T
-        polygon = Polygon(xy_pairs)
-        polygons.append(polygon)
-    gs = GeoSeries(polygons, index=df_coords.index)
-    polygons_gdf = GeoDataFrame(geometry=gs)
-    polygons_gdf = ShapesModel.parse(polygons_gdf)
-    shapes[f"{SK.REGION}_polygons"] = polygons_gdf
+    shapes[f"{SK.REGION}_polygons"] = _create_cell_polygons_from_borders(
+        cellbin_gef, x_original, y_original, cells_table.obs.index
+    )
 
     for cell_mask_name in cell_mask_file:
         masks = imread(path / SK.REGISTER / cell_mask_name, **imread_kwargs)
+        masks = _convert_uint16_to_uint8(np.asarray(masks))
         masks = Image2DModel.parse(
             masks,
             dims=("c", "y", "x"),
@@ -348,7 +484,10 @@ def stereoseq_v8(
     path: str | Path,
     dataset_id: str | None = None,
     bin_sizes: list[int] | None = None,
+    gene_list: list[str] | None = None,
+    include_counts_in_points: bool = True,
     load_analysis: bool = True,
+    load_cellbin: bool = False,
     imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
 ) -> SpatialData:
@@ -365,9 +504,25 @@ def stereoseq_v8(
     bin_sizes
         List of bin sizes to read from the tissue.gef file (e.g., [1, 20, 50, 100]).
         If None, reads all available bin sizes. Common bins are 1, 5, 10, 20, 50, 100, 150, 200.
+    gene_list
+        Optional list of gene names to filter transcripts. When provided, creates points elements
+        with x, y, gene (and optionally count) columns for single-molecule analysis, similar to
+        Xenium/MERSCOPE output. This enables use with ``spatialdata.aggregate()`` for cell-level
+        quantification. When None (default), uses the original behavior with deduplicated
+        bin coordinates (more memory efficient for whole-transcriptome data).
+    include_counts_in_points
+        If True (default) and gene_list is provided, includes the 'count' column in points.
+        Stereo-seq captures multiple reads per transcript location, so the count column contains
+        the number of reads at each (x, y, gene) coordinate. This is different from Xenium/MERSCOPE
+        where each point represents a single molecule.
     load_analysis
         If True, will load pre-computed analysis results (h5ad files) from the analysis directory.
         These typically contain clustering, dimensionality reduction, and other analysis results.
+    load_cellbin
+        If True, will load cell segmentation data from cellbin.gef files in the feature_expression
+        directory. This adds cell-level tables with metadata (cellID, area, gene count, etc.),
+        cell shapes (circles from area and polygons from borders), and expression data.
+        The cellbin file is auto-detected as ``*.adjusted.cellbin.gef`` or ``*.cellbin.gef``.
     imread_kwargs
         Keyword arguments passed to :func:`dask_image.imread.imread`.
     image_models_kwargs
@@ -380,9 +535,26 @@ def stereoseq_v8(
     Notes
     -----
     SAW v8 Structure:
-        - feature_expression/: Contains .tissue.gef files with gene expression data
+        - feature_expression/: Contains .tissue.gef and .cellbin.gef files
         - analysis/: Contains pre-computed h5ad files
         - image/: Contains microscopy images (.tif/.tiff format, e.g., H&E, ssDNA, or other stains)
+
+    Examples
+    --------
+    Read with default behavior (deduplicated bin coordinates):
+
+    >>> sdata = stereoseq_v8(path)
+
+    Read with gene filtering for single-molecule analysis:
+
+    >>> sdata = stereoseq_v8(path, gene_list=["Adgre1", "Lyve1", "Cxcl1"])
+    >>> # Points now have columns: x, y, gene, count
+    >>> # Can be used with spatialdata.aggregate() for cell-level quantification
+
+    Read with cellbin data for cell-level analysis:
+
+    >>> sdata = stereoseq_v8(path, load_cellbin=True)
+    >>> # Adds 'cells_table', 'cells_circles', 'cells_polygons' elements
     """
     image_models_kwargs, _ = _initialize_raster_models_kwargs(image_models_kwargs, {})
     path = Path(path)
@@ -453,6 +625,9 @@ def stereoseq_v8(
             # (y, x, c) -> (c, y, x)
             if img_data.ndim == 3 and img_data.shape[-1] in [1, 3, 4]:
                 img_data = np.moveaxis(img_data, -1, 0)
+
+            # Convert uint16 to uint8
+            img_data = _convert_uint16_to_uint8(np.asarray(img_data))
 
             # img_data is now (c, y, x)
             n_channels = img_data.shape[0] if img_data.ndim == 3 else 1
@@ -562,6 +737,49 @@ def stereoseq_v8(
         ).tocsr()
 
         # Create points element
+        # If gene_list is provided, create molecule-level points with gene and count columns
+        # Otherwise, use deduplicated bin coordinates (original behavior)
+        if gene_list is not None:
+            # Filter df_points to only include genes in the gene_list
+            # First, get the original gene names (before making unique)
+            df_points_with_original_gene = df_points.copy()
+            df_points_with_original_gene["original_gene"] = [
+                name
+                for _, (name, cell_count) in df_gene[[SK.GENE_NAME, SK.COUNT]].iterrows()
+                for _ in range(cell_count)
+            ]
+            
+            # Filter to genes in the gene_list
+            gene_mask = df_points_with_original_gene["original_gene"].isin(gene_list)
+            df_points_filtered = df_points_with_original_gene[gene_mask].copy()
+            
+            if len(df_points_filtered) > 0:
+                # Create points DataFrame with x, y, gene columns
+                points_df = pd.DataFrame({
+                    "x": df_points_filtered[SK.COORD_X].values.astype(float),
+                    "y": df_points_filtered[SK.COORD_Y].values.astype(float),
+                    "gene": df_points_filtered["original_gene"].astype("category"),
+                })
+                
+                # Optionally include count column
+                if include_counts_in_points:
+                    points_df["count"] = df_points_filtered[SK.COUNT].values
+                
+                # Create molecule-level points element with gene annotation
+                name_transcripts_element = f"{bin_name}_transcripts"
+                points_element = PointsModel.parse(
+                    points_df,
+                    coordinates={"x": "x", "y": "y"},
+                    feature_key="gene",
+                )
+                points[name_transcripts_element] = points_element
+            else:
+                warnings.warn(
+                    f"No transcripts found for genes {gene_list} in {bin_name}. "
+                    f"Available genes: {df_gene[SK.GENE_NAME].unique()[:10].tolist()}..."
+                )
+        
+        # Always create deduplicated bin coordinates points (original behavior)
         points_coords_for_points = points_coords.drop(columns=["bin_id"])
         points_element = PointsModel.parse(
             points_coords_for_points,
@@ -674,6 +892,67 @@ def stereoseq_v8(
                         coordinates={"x": SK.COORD_X, "y": SK.COORD_Y},
                     )
                     points[region_name] = points_element
+
+    # Load cellbin data if requested
+    if load_cellbin:
+        feature_exp_path = path / "feature_expression"
+        # Find cellbin file - prefer .adjusted.cellbin.gef, fallback to .cellbin.gef
+        cellbin_files = list(feature_exp_path.glob("*.adjusted.cellbin.gef"))
+        if not cellbin_files:
+            cellbin_files = list(feature_exp_path.glob("*.cellbin.gef"))
+        
+        if cellbin_files:
+            cellbin_path = cellbin_files[0]
+            cellbin_gef = h5py.File(str(cellbin_path), "r")
+            
+            # Read cellbin data using shared helper
+            adata_cells, obsm_spatial = _read_cellbin_data(cellbin_gef, base_adata=None)
+            
+            # Add region and instance_id to obs for the TableModel
+            adata_cells.obs[SK.REGION_KEY] = f"{SK.REGION}_circles"
+            adata_cells.obs[SK.REGION_KEY] = adata_cells.obs[SK.REGION_KEY].astype("category")
+            adata_cells.obs[SK.INSTANCE_KEY] = adata_cells.obs.index
+            
+            # Create table
+            cells_table = TableModel.parse(
+                adata_cells,
+                region=f"{SK.REGION.value}_circles",
+                region_key=SK.REGION_KEY.value,
+                instance_key=SK.INSTANCE_KEY.value,
+            )
+            tables[f"{SK.REGION}_table"] = cells_table
+            
+            # Create cell circle shapes from area
+            radii = np.sqrt(adata_cells.obs[SK.CELL_AREA].to_numpy() / np.pi)
+            cells_circles = ShapesModel.parse(
+                adata_cells.obsm[SK.SPATIAL_KEY],
+                geometry=0,
+                radius=radii,
+                index=adata_cells.obs[SK.INSTANCE_KEY],
+            )
+            cells_circles.index.name = None
+            shapes[f"{SK.REGION}_circles"] = cells_circles
+            
+            # Create cell polygon shapes from borders if available
+            if SK.CELL_BORDER in cellbin_gef[SK.CELL_BIN]:
+                x_centroids = pd.Series(
+                    obsm_spatial[:, 0],
+                    index=adata_cells.obs.index,
+                )
+                y_centroids = pd.Series(
+                    obsm_spatial[:, 1],
+                    index=adata_cells.obs.index,
+                )
+                shapes[f"{SK.REGION}_polygons"] = _create_cell_polygons_from_borders(
+                    cellbin_gef, x_centroids, y_centroids, adata_cells.obs.index
+                )
+            
+            cellbin_gef.close()
+        else:
+            warnings.warn(
+                f"load_cellbin=True but no cellbin.gef files found in {feature_exp_path}. "
+                "Expected files matching *.adjusted.cellbin.gef or *.cellbin.gef"
+            )
 
     tissue_gef.close()
     
