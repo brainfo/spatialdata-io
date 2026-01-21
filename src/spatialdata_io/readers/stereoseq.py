@@ -215,14 +215,54 @@ def _read_cellbin_data(
         base_adata.obsm[SK.SPATIAL_KEY] = obsm_spatial
         adata = base_adata
     else:
-        # Create minimal AnnData for cellbin-only mode
+        # Create AnnData for cellbin-only mode with expression matrix
         obs.index = obs.index.astype(str)
         var = var.set_index(SK.GENE_NAME)
         var.index.name = None
-        adata = ad.AnnData(obs=obs, var=var)
+
+        # Build the cell x gene expression matrix from cellExp data
+        # cellExp contains (gene_id, count) pairs for each cell, ordered by cell offset
+        cell_exp = cellbin_gef[SK.CELL_BIN][SK.CELL_EXP]
+        gene_ids = cell_exp[SK.GENE_ID][:]
+        counts = cell_exp[SK.COUNT][:]
+
+        # Use cell offsets to determine which cell each expression entry belongs to
+        # obs has "offset" column which is the starting index in cellExp for each cell
+        # and "geneCount" which is the number of genes expressed in that cell
+        cell_offsets = obs[SK.OFFSET].values
+        gene_counts = obs[SK.GENE_COUNT].values
+
+        # Create row indices (cell indices) for sparse matrix
+        n_cells = len(obs)
+        row_indices = np.repeat(np.arange(n_cells), gene_counts)
+
+        # Create sparse expression matrix
+        n_genes = len(var)
+        expression_matrix = coo_matrix(
+            (counts, (row_indices, gene_ids)),
+            shape=(n_cells, n_genes),
+        ).tocsr()
+
+        # Make var_names unique before creating AnnData
+        var["gene_name_original"] = var.index.copy()
+        # Handle duplicates by appending suffix
+        if var.index.duplicated().any():
+            var.index = pd.Index(var.index).astype(str)
+            seen = {}
+            new_names = []
+            for name in var.index:
+                if name in seen:
+                    seen[name] += 1
+                    new_names.append(f"{name}-{seen[name]}")
+                else:
+                    seen[name] = 0
+                    new_names.append(name)
+            var.index = pd.Index(new_names)
+
+        adata = ad.AnnData(X=expression_matrix, obs=obs, var=var)
         adata.obsm[SK.SPATIAL_KEY] = obsm_spatial
 
-    # Add expression data to uns
+    # Add expression data to uns (keep for backwards compatibility)
     cell_exp = cellbin_gef[SK.CELL_BIN][SK.CELL_EXP]
     gene_exp = cellbin_gef[SK.CELL_BIN][SK.GENE_EXP]
     cellbin_uns = {
@@ -896,26 +936,125 @@ def stereoseq_v8(
     # Load cellbin data if requested
     if load_cellbin:
         feature_exp_path = path / "feature_expression"
-        # Find cellbin file - prefer .adjusted.cellbin.gef, fallback to .cellbin.gef
-        cellbin_files = list(feature_exp_path.glob("*.adjusted.cellbin.gef"))
-        if not cellbin_files:
-            cellbin_files = list(feature_exp_path.glob("*.cellbin.gef"))
         
-        if cellbin_files:
-            cellbin_path = cellbin_files[0]
-            cellbin_gef = h5py.File(str(cellbin_path), "r")
+        # Find cellbin h5ad file in analysis directory - prefer adjusted, fallback to regular
+        # Pattern: {dataset_id}.cellbin_1.0.adjusted.h5ad or {dataset_id}.cellbin_1.0.h5ad
+        cellbin_h5ad_files = list(analysis_dir.glob("*.cellbin*.adjusted.h5ad"))
+        if not cellbin_h5ad_files:
+            cellbin_h5ad_files = list(analysis_dir.glob("*.cellbin*.h5ad"))
+        
+        # Find cellbin gef file - prefer adjusted, fallback to regular
+        cellbin_gef_files = list(feature_exp_path.glob("*.adjusted.cellbin.gef"))
+        if not cellbin_gef_files:
+            cellbin_gef_files = list(feature_exp_path.glob("*.cellbin.gef"))
+        
+        if cellbin_h5ad_files and cellbin_gef_files:
+            # Read h5ad file - this provides the expression matrix (like original stereoseq)
+            adata = ad.read_h5ad(cellbin_h5ad_files[0])
             
-            # Read cellbin data using shared helper
-            adata_cells, obsm_spatial = _read_cellbin_data(cellbin_gef, base_adata=None)
+            # Read cellbin.gef for additional metadata
+            cellbin_gef = h5py.File(str(cellbin_gef_files[0]), "r")
+            
+            # Add cell info to obs (from cellbin.gef)
+            obs = pd.DataFrame(cellbin_gef[SK.CELL_BIN][SK.CELL_DATASET][:])
+            obs.columns = [
+                SK.CELL_ID,
+                SK.COORD_X,
+                SK.COORD_Y,
+                SK.OFFSET,
+                SK.GENE_COUNT,
+                SK.EXP_COUNT,
+                SK.DNBCOUNT,
+                SK.CELL_AREA,
+                SK.CELL_TYPE_ID,
+                SK.CLUSTER_ID,
+            ]
+            obs[SK.CELL_EXON] = cellbin_gef[SK.CELL_BIN][SK.CELL_EXON][:]
+            
+            # Add centroids to obsm
+            obsm_spatial = obs[[SK.COORD_X, SK.COORD_Y]].to_numpy()
+            obs = obs.drop([SK.COORD_X, SK.COORD_Y], axis=1)
+            adata.obsm[SK.SPATIAL_KEY] = obsm_spatial
+            
+            # Add gene info to var (from cellbin.gef)
+            var = pd.DataFrame(
+                cellbin_gef[SK.CELL_BIN][SK.FEATURE_KEY][:],
+                columns=[
+                    SK.GENE_NAME,
+                    SK.OFFSET,
+                    SK.CELL_COUNT,
+                    SK.EXP_COUNT,
+                    SK.MAX_MID_COUNT,
+                ],
+            )
+            var[SK.GENE_NAME] = var[SK.GENE_NAME].str.decode("utf-8")
+            var[SK.GENE_EXON] = cellbin_gef[SK.CELL_BIN][SK.GENE_EXON][:]
+            
+            # Merge columns of obs and var to adata.obs and adata.var
+            # First, validate that h5ad and cellbin.gef have matching cell counts
+            if len(adata.obs) != len(obs):
+                raise ValueError(
+                    f"Cell count mismatch: h5ad has {len(adata.obs)} cells, "
+                    f"cellbin.gef has {len(obs)} cells. "
+                    f"Make sure you're using matching h5ad and cellbin.gef files."
+                )
+            if len(adata.var) != len(var):
+                raise ValueError(
+                    f"Gene count mismatch: h5ad has {len(adata.var)} genes, "
+                    f"cellbin.gef has {len(var)} genes. "
+                    f"Make sure you're using matching h5ad and cellbin.gef files."
+                )
+            
+            obs.index = adata.obs.index
+            # Handle potential column name conflicts by using suffixes
+            adata.obs = pd.merge(
+                adata.obs, obs, 
+                left_index=True, right_index=True, 
+                suffixes=('', '_cellbin')
+            )
+            var.index = adata.var.index
+            adata.var = pd.merge(
+                adata.var, var, 
+                left_index=True, right_index=True, 
+                suffixes=('', '_cellbin')
+            )
             
             # Add region and instance_id to obs for the TableModel
-            adata_cells.obs[SK.REGION_KEY] = f"{SK.REGION}_circles"
-            adata_cells.obs[SK.REGION_KEY] = adata_cells.obs[SK.REGION_KEY].astype("category")
-            adata_cells.obs[SK.INSTANCE_KEY] = adata_cells.obs.index
+            adata.obs[SK.REGION_KEY] = f"{SK.REGION}_circles"
+            adata.obs[SK.REGION_KEY] = adata.obs[SK.REGION_KEY].astype("category")
+            adata.obs[SK.INSTANCE_KEY] = adata.obs.index
+            
+            # Add all leftover columns in cellbin which don't fit .obs or .var to uns
+            cell_exp = cellbin_gef[SK.CELL_BIN][SK.CELL_EXP]
+            gene_exp = cellbin_gef[SK.CELL_BIN][SK.GENE_EXP]
+            cellbin_uns = {
+                SK.GENE_ID: cell_exp[SK.GENE_ID][:],
+                SK.CELL_EXP: cell_exp[SK.COUNT][:],
+                SK.GENE_EXP_EXON: cellbin_gef[SK.CELL_BIN][SK.CELL_EXP_EXON][:],
+                SK.CELL_ID: gene_exp[SK.CELL_ID][:],
+                SK.GENE_EXP: gene_exp[SK.COUNT][:],
+            }
+            cellbin_uns_df = pd.DataFrame(cellbin_uns)
+            
+            adata.uns["cellBin_cell_gene_exon_exp"] = cellbin_uns_df
+            adata.uns["cellBin_blockIndex"] = cellbin_gef[SK.CELL_BIN][SK.BLOCK_INDEX][:]
+            adata.uns["cellBin_blockSize"] = cellbin_gef[SK.CELL_BIN][SK.BLOCK_SIZE][:]
+            adata.uns["cellBin_cellTypeList"] = cellbin_gef[SK.CELL_BIN][SK.CELL_TYPE_LIST][:]
+            
+            # Add cellbin attrs to uns
+            cellbin_attrs = {}
+            for key in cellbin_gef.attrs.keys():
+                cellbin_attrs[key] = cellbin_gef.attrs[key]
+            adata.uns["cellBin_attrs"] = cellbin_attrs
+            
+            # Correct dtype for categorical columns
+            for column_name in [SK.CELL_TYPE_ID, SK.CLUSTER_ID]:
+                if column_name in adata.obs.columns:
+                    adata.obs[column_name] = adata.obs[column_name].astype("category")
             
             # Create table
             cells_table = TableModel.parse(
-                adata_cells,
+                adata,
                 region=f"{SK.REGION.value}_circles",
                 region_key=SK.REGION_KEY.value,
                 instance_key=SK.INSTANCE_KEY.value,
@@ -923,12 +1062,14 @@ def stereoseq_v8(
             tables[f"{SK.REGION}_table"] = cells_table
             
             # Create cell circle shapes from area
-            radii = np.sqrt(adata_cells.obs[SK.CELL_AREA].to_numpy() / np.pi)
+            # Handle potential column name suffix from merge conflict
+            area_col = SK.CELL_AREA if SK.CELL_AREA in adata.obs.columns else f"{SK.CELL_AREA}_cellbin"
+            radii = np.sqrt(adata.obs[area_col].to_numpy() / np.pi)
             cells_circles = ShapesModel.parse(
-                adata_cells.obsm[SK.SPATIAL_KEY],
+                adata.obsm[SK.SPATIAL_KEY],
                 geometry=0,
                 radius=radii,
-                index=adata_cells.obs[SK.INSTANCE_KEY],
+                index=adata.obs[SK.INSTANCE_KEY],
             )
             cells_circles.index.name = None
             shapes[f"{SK.REGION}_circles"] = cells_circles
@@ -937,21 +1078,26 @@ def stereoseq_v8(
             if SK.CELL_BORDER in cellbin_gef[SK.CELL_BIN]:
                 x_centroids = pd.Series(
                     obsm_spatial[:, 0],
-                    index=adata_cells.obs.index,
+                    index=adata.obs.index,
                 )
                 y_centroids = pd.Series(
                     obsm_spatial[:, 1],
-                    index=adata_cells.obs.index,
+                    index=adata.obs.index,
                 )
                 shapes[f"{SK.REGION}_polygons"] = _create_cell_polygons_from_borders(
-                    cellbin_gef, x_centroids, y_centroids, adata_cells.obs.index
+                    cellbin_gef, x_centroids, y_centroids, adata.obs.index
                 )
             
             cellbin_gef.close()
         else:
+            missing = []
+            if not cellbin_h5ad_files:
+                missing.append(f"cellbin h5ad in {analysis_dir}")
+            if not cellbin_gef_files:
+                missing.append(f"cellbin.gef in {feature_exp_path}")
             warnings.warn(
-                f"load_cellbin=True but no cellbin.gef files found in {feature_exp_path}. "
-                "Expected files matching *.adjusted.cellbin.gef or *.cellbin.gef"
+                f"load_cellbin=True but missing files: {', '.join(missing)}. "
+                "Expected *.cellbin*.h5ad in analysis/ and *.cellbin.gef in feature_expression/"
             )
 
     tissue_gef.close()
